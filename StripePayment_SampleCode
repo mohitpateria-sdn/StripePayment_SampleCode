@@ -1,0 +1,239 @@
+<?php
+//Stripe Payment
+namespace App\Http\Controllers;
+
+use App\Mail\PaidForLesson;
+use App\Models\Client;
+use App\Models\Lesson;
+use App\Models\LessonSummary;
+use App\Models\Payment;
+use App\Models\Tutor;
+use App\Models\Tutorclient;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Validator;
+
+class PaymentController extends Controller
+{
+	// Create a payment link
+    public static function createPayment($lessonSummary)
+    {
+        try {
+            $random_string = md5(microtime());
+            $tutor_id = Tutor::where('user_id', Auth::id())->first()->id;
+            $client_id = Client::where('user_id', $lessonSummary['client_id'])->first()->id;
+            $lesson_price = Tutorclient::where([
+                ['tutor_id', '=', $tutor_id],
+                ['client_id', '=', $client_id],
+                ['lesson_id', '=', $lessonSummary['lesson_id']],
+            ])->first()->price;
+            Payment::create([
+                'user_id' => $lessonSummary['client_id'],
+                'lesson_summary_id' => $lessonSummary['id'],
+                'payment_id' => $random_string,
+                'stripe_id' => null,
+                'price' => $lesson_price,
+                'paid' => 'false',
+            ]);
+
+            $link = Crypt::encryptString($random_string);
+
+            return $link;
+        } catch (\Exception $ex) {
+            return response()->json([
+                'status' => 'error',
+                'message' => $ex->getMessage(),
+                'error_details' => 'on line : '.$ex->getLine().' on file : '.$ex->getFile(),
+                'status_code' => 400,
+            ], 400);
+        }
+    }
+
+    // Check the payment link validity
+    public function checkToken($token)
+    {
+        try {
+            $token = Crypt::decryptString($token);
+            $payment = Payment::where('payment_id', $token)->first();
+
+            if (empty($payment)) {
+                throw new \Exception('Invalid payment link', 1);
+            }
+            if ($payment->paid == 'true' && $payment->stripe_id) {
+                throw new \Exception('You have already paid for the lesson', 2);
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'price' => $payment->price,
+                'status_code' => 200,
+            ], 200);
+        } catch (\Exception $ex) {
+            return response()->json([
+                'status' => 'error',
+                'message' => $ex->getMessage(),
+                'error_details' => 'on line : '.$ex->getLine().' on file : '.$ex->getFile(),
+                'status_code' => 400,
+            ], 400);
+        }
+    }
+
+    // Process the payment from the link.
+    public function pay(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'payment_id' => 'required',
+                'stripe_token' => 'required',
+            ]);
+            if ($validator->fails()) {
+                foreach ($validator->messages()->getMessages() as $field_name => $messages) {
+                    throw new Exception($messages[0], 1);
+                }
+            }
+
+
+            \Stripe\Stripe::setApiKey(config('services.stripe.secret'));
+
+            // Token is created using Checkout or Elements!
+            // Get the payment token ID submitted by the form:
+            DB::beginTransaction();
+            $payment_id = Crypt::decryptString($request->payment_id);
+            $token = $request->stripe_token['id'];
+
+            $payment = Payment::where('payment_id', $payment_id)->first();
+
+            if ($payment->paid == 'true') {
+                throw new \Exception('You have alread paid for this lesson.', 1);
+            }
+            $lessonSummary = LessonSummary::find($payment->lesson_summary_id);
+
+            $lesson_name = Lesson::find($lessonSummary->lesson_id);
+            $lesson = Payment::where('lesson_summary_id', $lessonSummary->id)->first();
+
+            $charge = \Stripe\Charge::create([
+                'amount' => ($lesson->price * 100),
+                'currency' => 'gbp',
+                'description' => $lesson_name->name,
+                'source' => $token,
+            ]);
+
+            $email_to = User::find($payment->user_id)->email;
+            
+            if ($charge['status'] == 'succeeded') {
+                $payment->paid = 'true';
+                $payment->stripe_id = $charge['id'];
+                $payment->save();
+                $lessonSummary->paid = 'true';
+                $lessonSummary->save();
+                Mail::to($email_to)->queue(new PaidForLesson($charge['receipt_url']));
+                DB::commit();
+
+                return response()->json([
+                    'status' => 'success',
+                    'data' => $charge,
+                    'status_code' => 200,
+                ], 200);
+            }
+        } catch (\Exception $ex) {
+            DB::rollBack();
+
+            return response()->json([
+                'status' => 'error',
+                'message' => $ex->getMessage(),
+                'error_details' => 'on line : '.$ex->getLine().' on file : '.$ex->getFile(),
+                'status_code' => 400,
+            ], 400);
+        }
+    }
+
+    // Make the payment using stripe frontend elements
+    public function appPay(Request $request)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'stripe_token' => 'required',
+                'arrForLessons.*.summary_id' => 'required',
+            ]);
+            if ($validator->fails()) {
+                foreach ($validator->messages()->getMessages() as $field_name => $messages) {
+                    throw new \Exception($messages[0], 1);
+                }
+            }
+            \Stripe\Stripe::setApiKey(config('services.stripe.secret'));
+            $lesson_summary_ids = [];
+            foreach ($request->arrForLessons as $key => $value) {
+                $lesson_summary_id = LessonSummary::where([
+                    ['id', '=', $value['summary_id']],
+                    ['client_id', '=', Auth::id()],
+                    ['paid', '=', 'false'],
+                ])->pluck('id');
+                if (!$lesson_summary_id->isEmpty()) {
+                    $lesson_summary_ids[] = $lesson_summary_id;
+                }
+            }
+            if (empty($lesson_summary_ids)) {
+                throw new \Exception('No lesson to pay for', 1);
+            }
+            $payments = Payment::whereIn('lesson_summary_id', $lesson_summary_ids)->get();
+            if ($payments->isEmpty()) {
+                throw new \Exception('No payments found', 2);
+            }
+            $total_price = 0;
+            foreach ($payments as $key => $payment) {
+                if ($payment['paid'] == 'false') {
+                    $total_price += $payment['price'];
+                }
+            }
+            // Token is created using Checkout or Elements!
+            // Get the payment token ID submitted by the form:
+            DB::beginTransaction();
+
+            $token = $request->stripe_token;
+
+            $charge = \Stripe\Charge::create([
+                'amount' => ($total_price * 100),
+                'currency' => 'gbp',
+                'description' => 'Payment for multiple lessons',
+                'source' => $token,
+            ]);
+
+            $email_to = User::find($payment->user_id)->email;
+
+            if ($charge['status'] == 'succeeded') {
+                foreach ($payments as $key => $payment) {
+                    $payment->paid = 'true';
+                    $payment->stripe_id = $charge['id'];
+                    $payment->save();
+                }
+                foreach ($lesson_summary_ids as $key => $lesson_summary_id) {
+                    $lessonSummary = LessonSummary::where('id', $lesson_summary_id)->first();
+                    $lessonSummary->paid = 'true';
+                    $lessonSummary->save();
+                }
+                Mail::to($email_to)->queue(new PaidForLesson($charge['receipt_url']));
+                DB::commit();
+
+                return response()->json([
+                    'status' => 'success',
+                    'message' => 'Payment successful',
+                    'data' => $charge,
+                    'status_code' => 200,
+                ], 200);
+            }
+        } catch (\Exception $ex) {
+            DB::rollBack();
+
+            return response()->json([
+                'status' => 'error',
+                'message' => $ex->getMessage(),
+                'error_details' => 'on line : '.$ex->getLine().' on file : '.$ex->getFile(),
+                'status_code' => 400,
+            ], 400);
+        }
+    }
+}
